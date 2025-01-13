@@ -1,8 +1,10 @@
-use crate::Error;
-
-use super::{ext::BoolExt, ext::ReadExt, Compression, Version, VersionMajor};
-use byteorder::{ReadBytesExt, WriteBytesExt, LE};
 use std::io;
+
+use byteorder::{LE, ReadBytesExt, WriteBytesExt};
+
+use crate::{Error, reader, writer};
+
+use super::{Compression, ext::BoolExt, ext::ReadExt, Version, VersionMajor};
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum EntryLocation {
@@ -309,20 +311,7 @@ impl Entry {
         reader: &mut R,
         version: super::Version,
     ) -> Result<Self, super::Error> {
-
-        let bits = {
-            let tmp = reader.read_u32::<LE>()?;
-            #[cfg(not(feature = "wuthering-waves"))]
-            { tmp }
-            #[cfg(feature = "wuthering-waves")]
-            if version == Version::V12 {
-                reader.read_u8()?;
-                (tmp >> 16) & 0x3f | (tmp & 0xFFFF) << 6 | (tmp & (1 << 28)) >> 6 |
-                    (tmp & 0x0FC00000) << 1 | tmp & 0xE0000000
-            } else {
-                tmp
-            }
-        };
+        let bits = reader::flag_reader(reader, version)?;
 
         let compression = match (bits >> 23) & 0x3f {
             0 => None,
@@ -339,30 +328,11 @@ impl Entry {
             compression_block_size <<= 11;
         }
 
-        let mut var_int = |bit: u32| -> Result<_, super::Error> {
-            Ok(if (bits & (1 << bit)) != 0 {
-                reader.read_u32::<LE>()? as u64
-            } else {
-                reader.read_u64::<LE>()?
-            })
-        };
-
-        let (offset, uncompressed) = {
-            let offset = var_int(31)?;
-            let uncompressed = var_int(30)?;
-            #[cfg(not(feature = "wuthering-waves"))]
-            { (offset, uncompressed) }
-            #[cfg(feature = "wuthering-waves")]
-            if version == Version::V12 {
-                (uncompressed, offset)
-            } else {
-                (offset, uncompressed)
-            }
-        };
+        let (offset, uncompressed) = reader::offset_reader(reader, version, bits)?;
 
         let compressed = match compression {
             None => uncompressed,
-            _ => var_int(29)?,
+            _ => reader::read_safe(reader, bits, 29)?,
         };
 
         let offset_base = Entry::get_serialized_size(version, compression, compression_block_count);
@@ -429,69 +399,23 @@ impl Entry {
             | ((is_uncompressed_size_32_bit_safe as u32) << 30)
             | ((is_offset_32_bit_safe as u32) << 31);
 
-        #[cfg(not(feature = "wuthering-waves"))]
-        writer.write_u32::<LE>(flags)?;
-        #[cfg(feature = "wuthering-waves")]
-        if version == Version::V12 {
-            let tmp = ((flags & 0x3f) << 16) | ((flags >> 6) & 0xFFFF) |
-                ((flags << 6) & (1 << 28)) | ((flags >> 1) & 0x0FC00000) | flags & 0xE0000000;
-            writer.write_u32::<LE>(tmp)?;
-            writer.write_u8(0)?;
-        } else {
-            writer.write_u32::<LE>(flags)?;
-        }
+        writer::flag_writer(writer, version, flags)?;
 
         if compression_block_size == 0x3f {
             writer.write_u32::<LE>(self.compression_block_size)?;
         }
 
-        #[cfg(not(feature = "wuthering-waves"))]
-        {
-            if is_offset_32_bit_safe {
-                writer.write_u32::<LE>(self.offset as u32)?;
-            } else {
-                writer.write_u64::<LE>(self.offset)?;
-            }
-
-            if is_uncompressed_size_32_bit_safe {
-                writer.write_u32::<LE>(self.uncompressed as u32)?
-            } else {
-                writer.write_u64::<LE>(self.uncompressed)?
-            }
-        }
-        #[cfg(feature = "wuthering-waves")]
-        if version == Version::V12 {
-            if is_uncompressed_size_32_bit_safe {
-                writer.write_u32::<LE>(self.uncompressed as u32)?
-            } else {
-                writer.write_u64::<LE>(self.uncompressed)?
-            }
-
-            if is_offset_32_bit_safe {
-                writer.write_u32::<LE>(self.offset as u32)?;
-            } else {
-                writer.write_u64::<LE>(self.offset)?;
-            }
-        } else {
-            if is_offset_32_bit_safe {
-                writer.write_u32::<LE>(self.offset as u32)?;
-            } else {
-                writer.write_u64::<LE>(self.offset)?;
-            }
-
-            if is_uncompressed_size_32_bit_safe {
-                writer.write_u32::<LE>(self.uncompressed as u32)?
-            } else {
-                writer.write_u64::<LE>(self.uncompressed)?
-            }
-        }
+        writer::offset_writer(
+            writer,
+            version,
+            self.offset,
+            is_offset_32_bit_safe,
+            self.uncompressed,
+            is_uncompressed_size_32_bit_safe,
+        )?;
 
         if self.compression_slot.is_some() {
-            if is_size_32_bit_safe {
-                writer.write_u32::<LE>(self.compressed as u32)?;
-            } else {
-                writer.write_u64::<LE>(self.compressed)?;
-            }
+            writer::write_safe(writer, is_size_32_bit_safe, self.compressed)?;
 
             assert!(self.blocks.is_some());
             let blocks = self.blocks.as_ref().unwrap();

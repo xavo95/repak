@@ -4,6 +4,8 @@ mod error;
 mod ext;
 mod footer;
 mod pak;
+mod reader;
+mod writer;
 
 pub use {error::*, pak::*};
 
