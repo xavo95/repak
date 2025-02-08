@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+mod data;
 mod entry;
 mod error;
 mod ext;
@@ -7,18 +8,9 @@ mod pak;
 mod reader;
 mod writer;
 
-pub use {error::*, pak::*};
+pub use {data::PartialEntry, error::*, pak::*};
 
 pub const MAGIC: u32 = 0x5A6F12E1;
-
-#[cfg(feature = "oodle")]
-mod oodle {
-    pub type OodleGetter = fn() -> Result<OodleDecompress, Box<dyn std::error::Error>>;
-    pub type OodleDecompress = fn(comp_buf: &[u8], raw_buf: &mut [u8]) -> i32;
-}
-
-#[cfg(feature = "oodle_loader")]
-pub use oodle_loader;
 
 #[derive(
     Clone,
@@ -135,6 +127,7 @@ pub enum Compression {
     Gzip,
     Oodle,
     Zstd,
+    LZ4,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -151,12 +144,4 @@ impl From<aes::Aes256> for Key {
     fn from(value: aes::Aes256) -> Self {
         Self::Some(value)
     }
-}
-
-#[derive(Debug, Default)]
-pub(crate) enum Oodle {
-    #[cfg(feature = "oodle")]
-    Some(oodle::OodleGetter),
-    #[default]
-    None,
 }
