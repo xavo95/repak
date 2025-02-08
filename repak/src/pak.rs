@@ -1,5 +1,6 @@
+use crate::data::build_partial_entry;
 use crate::entry::Entry;
-use crate::Compression;
+use crate::{Compression, Error, PartialEntry};
 
 use super::ext::{ReadExt, WriteExt};
 use super::{Version, VersionMajor};
@@ -7,10 +8,17 @@ use byteorder::{ReadBytesExt, WriteBytesExt, LE};
 use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, Write};
 
+#[derive(Default, Clone, Copy)]
+pub(crate) struct Hash(pub(crate) [u8; 20]);
+impl std::fmt::Debug for Hash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Hash({})", hex::encode(self.0))
+    }
+}
+
 #[derive(Debug)]
 pub struct PakBuilder {
     key: super::Key,
-    oodle: super::Oodle,
     allowed_compression: Vec<Compression>,
 }
 
@@ -24,10 +32,6 @@ impl PakBuilder {
     pub fn new() -> Self {
         Self {
             key: Default::default(),
-            #[cfg(not(feature = "oodle_implicit_dynamic"))]
-            oodle: super::Oodle::None,
-            #[cfg(feature = "oodle_implicit_dynamic")]
-            oodle: super::Oodle::Some(oodle_loader::decompress),
             allowed_compression: Default::default(),
         }
     }
@@ -36,25 +40,20 @@ impl PakBuilder {
         self.key = super::Key::Some(key);
         self
     }
-    #[cfg(feature = "oodle_explicit")]
-    pub fn oodle(mut self, oodle_getter: super::oodle::OodleGetter) -> Self {
-        self.oodle = super::Oodle::Some(oodle_getter);
-        self
-    }
     #[cfg(feature = "compression")]
     pub fn compression(mut self, compression: impl IntoIterator<Item = Compression>) -> Self {
         self.allowed_compression = compression.into_iter().collect();
         self
     }
     pub fn reader<R: Read + Seek>(self, reader: &mut R) -> Result<PakReader, super::Error> {
-        PakReader::new_any_inner(reader, self.key, self.oodle)
+        PakReader::new_any_inner(reader, self.key)
     }
     pub fn reader_with_version<R: Read + Seek>(
         self,
         reader: &mut R,
         version: super::Version,
     ) -> Result<PakReader, super::Error> {
-        PakReader::new_inner(reader, version, self.key, self.oodle)
+        PakReader::new_inner(reader, version, self.key)
     }
     pub fn writer<W: Write + Seek>(
         self,
@@ -78,7 +77,6 @@ impl PakBuilder {
 pub struct PakReader {
     pak: Pak,
     key: super::Key,
-    oodle: super::Oodle,
 }
 
 #[derive(Debug)]
@@ -144,8 +142,8 @@ impl Index {
         self.entries
     }
 
-    fn add_entry(&mut self, path: &str, entry: super::entry::Entry) {
-        self.entries.insert(path.to_string(), entry);
+    fn add_entry(&mut self, path: String, entry: super::entry::Entry) {
+        self.entries.insert(path, entry);
     }
 }
 
@@ -166,14 +164,13 @@ impl PakReader {
     fn new_any_inner<R: Read + Seek>(
         reader: &mut R,
         key: super::Key,
-        oodle: super::Oodle,
     ) -> Result<Self, super::Error> {
         use std::fmt::Write;
         let mut log = "\n".to_owned();
 
         for ver in Version::iter() {
             match Pak::read(&mut *reader, ver, &key) {
-                Ok(pak) => return Ok(Self { pak, key, oodle }),
+                Ok(pak) => return Ok(Self { pak, key }),
                 Err(err) => writeln!(log, "trying version {} failed: {}", ver, err)?,
             }
         }
@@ -184,9 +181,8 @@ impl PakReader {
         reader: &mut R,
         version: super::Version,
         key: super::Key,
-        oodle: super::Oodle,
     ) -> Result<Self, super::Error> {
-        Pak::read(reader, version, &key).map(|pak| Self { pak, key, oodle })
+        Pak::read(reader, version, &key).map(|pak| Self { pak, key })
     }
 
     pub fn version(&self) -> super::Version {
@@ -227,7 +223,6 @@ impl PakReader {
                 self.pak.version,
                 &self.pak.compression,
                 &self.key,
-                &self.oodle,
                 writer,
             ),
             None => Err(super::Error::MissingEntry(path.to_owned())),
@@ -273,24 +268,88 @@ impl<W: Write + Seek> PakWriter<W> {
         self.writer
     }
 
-    pub fn write_file(&mut self, path: &str, data: impl AsRef<[u8]>) -> Result<(), super::Error> {
+    pub fn write_file(
+        &mut self,
+        path: &str,
+        allow_compress: bool,
+        data: impl AsRef<[u8]>,
+    ) -> Result<(), super::Error> {
         self.pak.index.add_entry(
-            path,
+            path.to_string(),
             Entry::write_file(
                 &mut self.writer,
                 self.pak.version,
                 &mut self.pak.compression,
-                &self.allowed_compression,
-                data,
+                if allow_compress {
+                    &self.allowed_compression
+                } else {
+                    &[]
+                },
+                data.as_ref(),
             )?,
         );
 
         Ok(())
     }
 
+    pub fn entry_builder(&self) -> EntryBuilder {
+        EntryBuilder {
+            allowed_compression: self.allowed_compression.clone(),
+        }
+    }
+
+    pub fn write_entry<D: AsRef<[u8]>>(
+        &mut self,
+        path: String,
+        partial_entry: PartialEntry<D>,
+    ) -> Result<(), Error> {
+        let stream_position = self.writer.stream_position()?;
+
+        let entry = partial_entry.build_entry(
+            self.pak.version,
+            &mut self.pak.compression,
+            stream_position,
+        )?;
+
+        entry.write(
+            &mut self.writer,
+            self.pak.version,
+            crate::entry::EntryLocation::Data,
+        )?;
+
+        self.pak.index.add_entry(path, entry);
+        partial_entry.write_data(&mut self.writer)?;
+
+        Ok(())
+    }
     pub fn write_index(mut self) -> Result<W, super::Error> {
         self.pak.write(&mut self.writer, &self.key)?;
         Ok(self.writer)
+    }
+}
+
+struct Data<'d>(Box<dyn AsRef<[u8]> + Send + Sync + 'd>);
+impl AsRef<[u8]> for Data<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref().as_ref()
+    }
+}
+
+#[derive(Clone)]
+pub struct EntryBuilder {
+    allowed_compression: Vec<Compression>,
+}
+impl EntryBuilder {
+    /// Builds an entry in memory (compressed if requested) which must be written out later
+    pub fn build_entry<D: AsRef<[u8]> + Send + Sync>(
+        &self,
+        compress: bool,
+        data: D,
+    ) -> Result<PartialEntry<D>, Error> {
+        let compression = compress
+            .then_some(self.allowed_compression.as_slice())
+            .unwrap_or_default();
+        build_partial_entry(compression, data)
     }
 }
 
@@ -541,12 +600,12 @@ impl Pak {
             index_writer.write_u32::<LE>(1)?; // we have path hash index
             index_writer.write_u64::<LE>(path_hash_index_offset)?;
             index_writer.write_u64::<LE>(phi_buf.len() as u64)?; // path hash index size
-            index_writer.write_all(&hash(&phi_buf))?;
+            index_writer.write_all(&hash(&phi_buf).0)?;
 
             index_writer.write_u32::<LE>(1)?; // we have full directory index
             index_writer.write_u64::<LE>(full_directory_index_offset)?;
             index_writer.write_u64::<LE>(fdi_buf.len() as u64)?; // path hash index size
-            index_writer.write_all(&hash(&fdi_buf))?;
+            index_writer.write_all(&hash(&fdi_buf).0)?;
 
             index_writer.write_u32::<LE>(encoded_entries.len() as u32)?;
             index_writer.write_all(&encoded_entries)?;
@@ -584,11 +643,11 @@ impl Pak {
     }
 }
 
-fn hash(data: &[u8]) -> [u8; 20] {
+fn hash(data: &[u8]) -> Hash {
     use sha1::{Digest, Sha1};
     let mut hasher = Sha1::new();
     hasher.update(data);
-    hasher.finalize().into()
+    Hash(hasher.finalize().into())
 }
 
 fn generate_path_hash_index<W: Write>(

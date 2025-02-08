@@ -2,7 +2,7 @@ use std::io;
 
 use byteorder::{LE, ReadBytesExt, WriteBytesExt};
 
-use crate::{Error, reader, writer};
+use crate::{data::build_partial_entry, reader, writer, Error, Hash};
 
 use super::{Compression, ext::BoolExt, ext::ReadExt, Version, VersionMajor};
 
@@ -12,7 +12,7 @@ pub(crate) enum EntryLocation {
     Index,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct Block {
     pub start: u64,
     pub end: u64,
@@ -57,7 +57,7 @@ pub(crate) struct Entry {
     pub uncompressed: u64,
     pub compression_slot: Option<u32>,
     pub timestamp: Option<u64>,
-    pub hash: Option<[u8; 20]>,
+    pub hash: Option<Hash>,
     pub blocks: Option<Vec<Block>>,
     pub flags: u8,
     pub compression_block_size: u32,
@@ -105,127 +105,13 @@ impl Entry {
         version: Version,
         compression_slots: &mut Vec<Option<Compression>>,
         allowed_compression: &[Compression],
-        data: impl AsRef<[u8]>,
-    ) -> Result<Self, super::Error> {
-        // TODO hash needs to be post-compression
-        use sha1::{Digest, Sha1};
-        let mut hasher = Sha1::new();
-        hasher.update(&data);
-
-        let offset = writer.stream_position()?;
-        let len = data.as_ref().len() as u64;
-
-        // TODO possibly select best compression based on some criteria instead of picking first
-        let compression = allowed_compression.first().cloned();
-
-        let compression_slot = if let Some(compression) = compression {
-            // find existing
-            let slot = compression_slots
-                .iter()
-                .enumerate()
-                .find(|(_, s)| **s == Some(compression));
-            Some(if let Some((i, _)) = slot {
-                // existing found
-                i
-            } else {
-                if version.version_major() < VersionMajor::FNameBasedCompression {
-                    return Err(Error::Other(format!(
-                        "cannot use {compression:?} prior to FNameBasedCompression (pak version 8)"
-                    )));
-                }
-
-                // find empty slot
-                if let Some((i, empty_slot)) = compression_slots
-                    .iter_mut()
-                    .enumerate()
-                    .find(|(_, s)| s.is_none())
-                {
-                    // empty found, set it to used compression type
-                    *empty_slot = Some(compression);
-                    i
-                } else {
-                    // no empty slot found, add a new one
-                    compression_slots.push(Some(compression));
-                    compression_slots.len() - 1
-                }
-            } as u32)
-        } else {
-            None
-        };
-
-        let (blocks, compressed) = match compression {
-            #[cfg(not(feature = "compression"))]
-            Some(_) => {
-                unreachable!("should not be able to reach this point without compression feature")
-            }
-            #[cfg(feature = "compression")]
-            Some(compression) => {
-                use std::io::Write;
-
-                let entry_size = Entry::get_serialized_size(version, compression_slot, 1);
-                let data_offset = offset + entry_size;
-
-                let compressed = match compression {
-                    Compression::Zlib => {
-                        let mut compress = flate2::write::ZlibEncoder::new(
-                            Vec::new(),
-                            flate2::Compression::fast(),
-                        );
-                        compress.write_all(data.as_ref())?;
-                        compress.finish()?
-                    }
-                    Compression::Gzip => {
-                        let mut compress =
-                            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-                        compress.write_all(data.as_ref())?;
-                        compress.finish()?
-                    }
-                    Compression::Zstd => zstd::stream::encode_all(data.as_ref(), 0)?,
-                    Compression::Oodle => {
-                        return Err(Error::Other("writing Oodle compression unsupported".into()))
-                    }
-                };
-
-                let compute_offset = |index: usize| -> u64 {
-                    match version.version_major() >= VersionMajor::RelativeChunkOffsets {
-                        true => index as u64 + (data_offset - offset),
-                        false => index as u64 + data_offset,
-                    }
-                };
-
-                let blocks = vec![Block {
-                    start: compute_offset(0),
-                    end: compute_offset(compressed.len()),
-                }];
-
-                (Some(blocks), Some(compressed))
-            }
-            None => (None, None),
-        };
-
-        let entry = super::entry::Entry {
-            offset,
-            compressed: compressed
-                .as_ref()
-                .map(|c: &Vec<u8>| c.len() as u64)
-                .unwrap_or(len),
-            uncompressed: len,
-            compression_slot,
-            timestamp: None,
-            hash: Some(hasher.finalize().into()),
-            blocks,
-            flags: 0,
-            compression_block_size: compressed.as_ref().map(|_| len as u32).unwrap_or_default(),
-        };
-
-        entry.write(writer, version, EntryLocation::Data)?;
-
-        if let Some(compressed) = compressed {
-            writer.write_all(&compressed)?;
-        } else {
-            writer.write_all(data.as_ref())?;
-        }
-
+        data: &[u8],
+    ) -> Result<Self, Error> {
+        let partial_entry = build_partial_entry(allowed_compression, data)?;
+        let stream_position = writer.stream_position()?;
+        let entry = partial_entry.build_entry(version, compression_slots, stream_position)?;
+        entry.write(writer, version, crate::entry::EntryLocation::Data)?;
+        partial_entry.write_data(writer)?;
         Ok(entry)
     }
 
@@ -245,7 +131,7 @@ impl Entry {
             n => Some(n - 1),
         };
         let timestamp = (ver == VersionMajor::Initial).then_try(|| reader.read_u64::<LE>())?;
-        let hash = Some(reader.read_guid()?);
+        let hash = Some(Hash(reader.read_guid()?));
         let blocks = (ver >= VersionMajor::CompressionEncryption && compression.is_some())
             .then_try(|| reader.read_array(Block::read))?;
         let flags = (ver >= VersionMajor::CompressionEncryption)
@@ -289,7 +175,7 @@ impl Entry {
             writer.write_u64::<LE>(self.timestamp.unwrap_or_default())?;
         }
         if let Some(hash) = self.hash {
-            writer.write_all(&hash)?;
+            writer.write_all(&hash.0)?;
         } else {
             panic!("hash missing");
         }
@@ -391,6 +277,11 @@ impl Entry {
         let is_uncompressed_size_32_bit_safe = self.uncompressed <= u32::MAX as u64;
         let is_offset_32_bit_safe = self.offset <= u32::MAX as u64;
 
+        assert!(
+            compression_blocks_count < 0x10_000,
+            "compression blocks count fits in 16 bits"
+        );
+
         let flags = (compression_block_size)
             | (compression_blocks_count << 6)
             | ((self.is_encrypted() as u32) << 22)
@@ -436,7 +327,6 @@ impl Entry {
         version: Version,
         compression: &[Option<Compression>],
         #[allow(unused)] key: &super::Key,
-        #[allow(unused)] oodle: &super::Oodle,
         buf: &mut W,
     ) -> Result<(), super::Error> {
         reader.seek(io::SeekFrom::Start(self.offset))?;
@@ -464,7 +354,7 @@ impl Entry {
             }
         }
 
-        #[cfg(any(feature = "compression", feature = "oodle"))]
+        #[cfg(feature = "compression")]
         let ranges = {
             let offset = |index: u64| -> usize {
                 (match version.version_major() >= VersionMajor::RelativeChunkOffsets {
@@ -494,56 +384,52 @@ impl Entry {
 
         match self.compression_slot.and_then(|c| compression[c as usize]) {
             None => buf.write_all(&data)?,
-            #[cfg(feature = "compression")]
-            Some(Compression::Zlib) => decompress!(flate2::read::ZlibDecoder<&[u8]>),
-            #[cfg(feature = "compression")]
-            Some(Compression::Gzip) => decompress!(flate2::read::GzDecoder<&[u8]>),
-            #[cfg(feature = "compression")]
-            Some(Compression::Zstd) => {
-                for range in ranges {
-                    io::copy(&mut zstd::stream::read::Decoder::new(&data[range])?, buf)?;
-                }
-            }
-            #[cfg(feature = "oodle")]
-            Some(Compression::Oodle) => {
-                let oodle = match oodle {
-                    crate::Oodle::Some(getter) => getter().map_err(|_| super::Error::OodleFailed),
-                    crate::Oodle::None => Err(super::Error::OodleFailed),
-                }?;
-                let mut decompressed = vec![0; self.uncompressed as usize];
-
-                let mut compress_offset = 0;
-                let mut decompress_offset = 0;
-                let block_count = ranges.len();
-                for range in ranges {
-                    let decomp = if block_count == 1 {
-                        self.uncompressed as usize
-                    } else {
-                        (self.compression_block_size as usize)
-                            .min(self.uncompressed as usize - compress_offset)
-                    };
-                    let buffer = &mut data[range];
-                    let out = oodle(
-                        buffer,
-                        &mut decompressed[decompress_offset..decompress_offset + decomp],
-                    );
-                    if out == 0 {
-                        return Err(super::Error::DecompressionFailed(Compression::Oodle));
-                    }
-                    compress_offset += self.compression_block_size as usize;
-                    decompress_offset += out as usize;
-                }
-
-                debug_assert_eq!(
-                    decompress_offset, self.uncompressed as usize,
-                    "Oodle decompression length mismatch"
-                );
-                buf.write_all(&decompressed)?;
-            }
-            #[cfg(not(feature = "oodle"))]
-            Some(Compression::Oodle) => return Err(super::Error::Oodle),
             #[cfg(not(feature = "compression"))]
             _ => return Err(super::Error::Compression),
+            #[cfg(feature = "compression")]
+            Some(comp) => {
+                let chunk_size = if ranges.len() == 1 {
+                    self.uncompressed as usize
+                } else {
+                    self.compression_block_size as usize
+                };
+
+                match comp {
+                    Compression::Zlib => decompress!(flate2::read::ZlibDecoder<&[u8]>),
+                    Compression::Gzip => decompress!(flate2::read::GzDecoder<&[u8]>),
+                    Compression::Zstd => {
+                        for range in ranges {
+                            io::copy(&mut zstd::stream::read::Decoder::new(&data[range])?, buf)?;
+                        }
+                    }
+                    Compression::LZ4 => {
+                        let mut decompressed = vec![0; self.uncompressed as usize];
+                        for (decomp_chunk, comp_range) in
+                            decompressed.chunks_mut(chunk_size).zip(ranges)
+                        {
+                            lz4_flex::block::decompress_into(&data[comp_range], decomp_chunk)
+                                .map_err(|_| Error::DecompressionFailed(Compression::LZ4))?;
+                        }
+                        buf.write_all(&decompressed)?;
+                    }
+                    #[cfg(feature = "oodle")]
+                    Compression::Oodle => {
+                        let mut decompressed = vec![0; self.uncompressed as usize];
+                        for (decomp_chunk, comp_range) in
+                            decompressed.chunks_mut(chunk_size).zip(ranges)
+                        {
+                            let out =
+                                oodle_loader::oodle()?.decompress(&data[comp_range], decomp_chunk);
+                            if out == 0 {
+                                return Err(Error::DecompressionFailed(Compression::Oodle));
+                            }
+                        }
+                        buf.write_all(&decompressed)?;
+                    }
+                    #[cfg(not(feature = "oodle"))]
+                    Compression::Oodle => return Err(super::Error::Oodle),
+                }
+            }
         }
         buf.flush()?;
         Ok(())

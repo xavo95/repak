@@ -9,11 +9,8 @@ keywords.workspace = true
 
 [features]
 default = ["compression", "encryption"]
-compression = ["dep:flate2", "dep:zstd"]
-oodle = []
-oodle_loader = ["dep:oodle_loader"]
-oodle_explicit = ["oodle"]
-oodle_implicit_dynamic = ["dep:oodle_loader", "oodle"]
+compression = ["dep:flate2", "dep:zstd", "dep:lz4_flex"]
+oodle = ["dep:oodle_loader", "compression"]
 encryption = ["dep:aes"]
 wuthering-waves = []
 
@@ -22,10 +19,12 @@ byteorder = "1.5"
 aes = { workspace = true, optional = true }
 flate2 = { version = "1.0", optional = true }
 zstd = { version = "0.13", optional = true }
+lz4_flex = { version = "0.11.3", optional = true }
 oodle_loader = { path = "../oodle_loader", optional = true}
 thiserror = "2.0"
 sha1 = { workspace = true }
 strum = { workspace = true }
+hex.workspace = true
 
 [dev-dependencies]
 base64 = { workspace = true }
