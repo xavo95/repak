@@ -11,8 +11,12 @@ pub(crate) fn flag_writer<W: io::Write>(writer: &mut W,
     writer.write_u32::<LE>(flags)?;
     #[cfg(feature = "wuthering-waves")]
     if version == Version::V12 {
-        let tmp = ((flags & 0x3f) << 16) | ((flags >> 6) & 0xFFFF) |
-            ((flags << 6) & (1 << 28)) | ((flags >> 1) & 0x0FC00000) | flags & 0xE0000000;
+        let tmp =
+            ((flags & 0x3f) << 16) |
+                ((flags >> 6) & 0xFFFF) |
+                ((flags << 6) & (1 << 28)) | // (flags & (1 << 22)) << 6
+                ((flags >> 1) & 0x0FC00000) | // (flags & 0x1F800000) >> 1
+                flags & 0xE0000000;
         writer.write_u32::<LE>(tmp)?;
         writer.write_u8(0)?;
     } else {
