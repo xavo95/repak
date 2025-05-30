@@ -347,7 +347,23 @@ impl Entry {
                     return Err(super::Error::Encrypted);
                 };
                 use aes::cipher::BlockDecrypt;
-                for block in data.chunks_mut(16) {
+
+                let mut data_len = data.len();
+                #[cfg(feature = "wuthering-waves")]
+                {
+                    data_len = match self.compression_slot.and_then(|c| compression[c as usize]) {
+                        Some(Compression::Zlib) => {
+                            if data_len > 2048 {
+                                2048
+                            } else {
+                                data_len
+                            }
+                        },
+                        _ => data_len,
+                    };
+                }
+                
+                for block in data[..data_len].chunks_mut(16) {
                     key.decrypt_block(aes::Block::from_mut_slice(block))
                 }
                 data.truncate(self.compressed as usize);
