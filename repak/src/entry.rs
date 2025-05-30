@@ -350,17 +350,8 @@ impl Entry {
 
                 let mut data_len = data.len();
                 #[cfg(feature = "wuthering-waves")]
-                {
-                    data_len = match self.compression_slot.and_then(|c| compression[c as usize]) {
-                        Some(Compression::Zlib) => {
-                            if data_len > 2048 {
-                                2048
-                            } else {
-                                data_len
-                            }
-                        },
-                        _ => data_len,
-                    };
+                if let Some(Compression::Zlib) = self.compression_slot.and_then(|c| compression.get(c as usize).cloned()) {
+                    data_len = data_len.min(2048);
                 }
                 
                 for block in data[..data_len].chunks_mut(16) {
