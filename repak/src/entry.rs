@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, process::exit};
 
 use byteorder::{LE, ReadBytesExt, WriteBytesExt};
 
