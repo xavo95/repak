@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, process::exit};
 
 use byteorder::{LE, ReadBytesExt, WriteBytesExt};
 
@@ -347,7 +347,14 @@ impl Entry {
                     return Err(super::Error::Encrypted);
                 };
                 use aes::cipher::BlockDecrypt;
-                for block in data.chunks_mut(16) {
+
+                let mut data_len = data.len();
+                #[cfg(all(feature = "wuthering-waves", feature = "compression"))]
+                if let Some(Compression::Zlib) = self.compression_slot.and_then(|c| compression[c as usize]) {
+                    data_len = data_len.min(2048);
+                }
+                
+                for block in data[..data_len].chunks_mut(16) {
                     key.decrypt_block(aes::Block::from_mut_slice(block))
                 }
                 data.truncate(self.compressed as usize);
