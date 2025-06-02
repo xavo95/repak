@@ -70,6 +70,9 @@ impl Entry {
     pub fn is_deleted(&self) -> bool {
         0 != (self.flags >> 1) & 1
     }
+    pub fn is_partial_encrypted(&self) -> bool {
+        0 != (self.flags >> 3) & 1
+    }
     pub fn get_serialized_size(
         version: super::Version,
         compression: Option<u32>,
@@ -330,7 +333,7 @@ impl Entry {
         buf: &mut W,
     ) -> Result<(), super::Error> {
         reader.seek(io::SeekFrom::Start(self.offset))?;
-        Entry::read(reader, version)?;
+        let entry_read = Entry::read(reader, version)?;
         #[cfg(any(feature = "compression", feature = "oodle"))]
         let data_offset = reader.stream_position()?;
         #[allow(unused_mut)]
@@ -348,9 +351,14 @@ impl Entry {
                 };
                 use aes::cipher::BlockDecrypt;
 
-                let mut data_len = data.len();
+                #[cfg(not(feature = "wuthering-waves-2_4"))]
+                let data_len = data.len();
                 #[cfg(feature = "wuthering-waves-2_4")]
-                { data_len = data_len.min(2048); }
+                let data_len = if entry_read.is_partial_encrypted() {
+                    data.len().min(2048)
+                } else {
+                    data.len()
+                };
                 
                 for block in data[..data_len].chunks_mut(16) {
                     key.decrypt_block(aes::Block::from_mut_slice(block))
