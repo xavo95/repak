@@ -13,6 +13,7 @@ compression = ["dep:flate2", "dep:zstd", "dep:lz4_flex"]
 oodle = ["dep:oodle_loader", "compression"]
 encryption = ["dep:aes"]
 wuthering-waves = []
+wuthering-waves-2_4 = []
 
 [dependencies]
 byteorder = "1.5"
